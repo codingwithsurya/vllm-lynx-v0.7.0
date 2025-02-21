@@ -57,6 +57,8 @@ class Worker(LocalOrDistributedWorkerBase):
         self.rank = rank
         self.distributed_init_method = distributed_init_method
         self.is_driver_worker = is_driver_worker
+        MixtralLogitStore.create_instance(vllm_config)
+        MetricStore.get_or_create_instance(vllm_config)
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
             from vllm.utils import init_cached_hf_modules
@@ -167,7 +169,9 @@ class Worker(LocalOrDistributedWorkerBase):
                                             self.local_rank)
         # Set random seed.
         set_random_seed(self.model_config.seed)
-
+        MixtralLogitStore.get_instance().mark_profiling_done()
+        print("Profiling done and flag is being set")
+        MetricStore.get_instance().mark_profiling_done()
     def load_model(self):
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CuMemAllocator.get_instance()
@@ -449,7 +453,11 @@ class Worker(LocalOrDistributedWorkerBase):
             execute_model_req.seq_group_metadata_list = (
                 new_seq_group_metadata_list)
         output = super()._execute_model_spmd(execute_model_req,
-                                             intermediate_tensors)
+                                             intermediate_tensors)        
+        task_name = "WORKER_EXECUTE_MODEL"
+        with TaskLoggingContextManagerGPU(task_name):
+            output = self.model_runner.execute_model(seq_group_metadata_list,
+                                                    self.gpu_cache)
         return output
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
