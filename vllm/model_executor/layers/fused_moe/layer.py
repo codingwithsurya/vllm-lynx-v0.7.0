@@ -141,7 +141,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        topk_weights, topk_ids = FusedMoE.select_experts(
+        result = FusedMoE.select_experts(
             hidden_states=x,
             router_logits=router_logits,
             use_grouped_topk=use_grouped_topk,
@@ -152,13 +152,19 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
             e_score_correction_bias=e_score_correction_bias)
+        if custom_routing_function:
+            topk_weights, topk_ids, num_experts_to_keep = result
+        else:
+            topk_weights, topk_ids = result
+            num_experts_to_keep = None
 
         return fused_experts(hidden_states=x,
-                             w1=layer.w13_weight,
-                             w2=layer.w2_weight,
-                             topk_weights=topk_weights,
-                             topk_ids=topk_ids,
-                             inplace=True)
+                            w1=layer.w13_weight,
+                            w2=layer.w2_weight,
+                            topk_weights=topk_weights,
+                            topk_ids=topk_ids,
+                            inplace=True,
+                            num_experts_to_keep=num_experts_to_keep)
 
     def forward_cpu(
         self,
@@ -562,18 +568,14 @@ class FusedMoE(torch.nn.Module):
                 topk_group=topk_group,
                 scoring_func=scoring_func,
                 e_score_correction_bias=e_score_correction_bias)
-        elif custom_routing_function is None:
-            topk_weights, topk_ids = fused_topk(hidden_states=hidden_states,
-                                                gating_output=router_logits,
-                                                topk=top_k,
-                                                renormalize=renormalize)
+        elif custom_routing_function:
+            result = custom_routing_function(hidden_states, router_logits, top_k, renormalize)
+            if len(result) == 3:
+                return result  # (topk_weights, topk_ids, num_experts_to_keep)
+            return result[:2]  # (topk_weights, topk_ids)
         else:
-            topk_weights, topk_ids = custom_routing_function(
-                hidden_states=hidden_states,
-                gating_output=router_logits,
-                topk=top_k,
-                renormalize=renormalize)
-
+            topk_weights, topk_ids = fused_topk(hidden_states, router_logits, top_k, renormalize)
+            
         return topk_weights, topk_ids
 
     def forward(self, hidden_states: torch.Tensor,

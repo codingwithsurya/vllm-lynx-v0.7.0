@@ -31,6 +31,9 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe.fused_moe import (
+    fused_topk, extract_voting, apply_mask, optimize_expert_selection,
+    extract_important, apply_expert_mask)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                ReplicatedLinear,
@@ -41,6 +44,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead, VocabParallelEmbedding)
+from vllm.model_executor.mixtral_logit_store import MixtralLogitStore
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
@@ -69,9 +73,15 @@ class MixtralMoE(nn.Module):
                  params_dtype: Optional[torch.dtype] = None,
                  quant_config: Optional[QuantizationConfig] = None,
                  tp_size: Optional[int] = None,
-                 prefix: str = ""):
+                 prefix: str = "",
+                 num_experts_to_drop: int = 0):
         super().__init__()
         self.hidden_size = hidden_size
+
+        # [Lynx] Store Lynx-specific parameters
+        self.num_total_experts = num_experts
+        self.top_k = top_k
+        self.num_experts_to_drop = num_experts_to_drop
 
         # Gate always runs at half / full precision for now.
 
@@ -81,6 +91,25 @@ class MixtralMoE(nn.Module):
                                      params_dtype=params_dtype,
                                      quant_config=None,
                                      prefix=f"{prefix}.gate")
+        
+        def custom_routing_function(hidden_states, router_logits, topk, renormalize):
+            if self.num_experts_to_drop > 0:
+                # LYNX-Lat
+                topk_weights, topk_ids = fused_topk(hidden_states, router_logits, topk, renormalize)
+                sorted_expert_ids = extract_voting(topk_ids, topk, router_logits, self.num_total_experts)
+                router_logits = apply_mask(router_logits, sorted_expert_ids, self.num_experts_to_drop)
+                num_experts_to_keep = self.num_total_experts - self.num_experts_to_drop
+                topk_weights, topk_ids = fused_topk(hidden_states, router_logits, topk, renormalize)
+                return topk_weights, topk_ids, num_experts_to_keep
+            else:
+                # LYNX-Acc (alternative, commented out as in 0.4.3)
+                # topk_weights, topk_ids = fused_topk(hidden_states, router_logits, topk, renormalize)
+                # router_logits, num_experts_to_keep = optimize_expert_selection(
+                #     topk_ids, topk_weights, router_logits, self.num_total_experts, min_experts=2)
+                # topk_weights, topk_ids = fused_topk(hidden_states, router_logits, topk, renormalize)
+                # return topk_weights, topk_ids, num_experts_to_keep
+                topk_weights, topk_ids = fused_topk(hidden_states, router_logits, topk, renormalize)
+                return topk_weights, topk_ids, self.num_total_experts
 
         self.experts = FusedMoE(num_experts=num_experts,
                                 top_k=top_k,
@@ -91,7 +120,8 @@ class MixtralMoE(nn.Module):
                                 renormalize=True,
                                 quant_config=quant_config,
                                 tp_size=tp_size,
-                                prefix=f"{prefix}.experts")
+                                prefix=f"{prefix}.experts",
+                                custom_routing_function=custom_routing_function)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
@@ -99,7 +129,20 @@ class MixtralMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states, router_logits)
+        # [Lynx] Compute num_experts_to_keep based on phase
+        if (MixtralLogitStore.get_instance().profile_complete and
+            not MixtralLogitStore.get_instance().is_prefill and
+            self.num_experts_to_drop > 0):
+            # Decode phase: Apply LYNX-Lat
+            topk_weights, topk_ids, num_experts_to_keep = self.experts.custom_routing_function(
+                hidden_states, router_logits, self.top_k, True)
+            final_hidden_states = self.experts(hidden_states, router_logits)
+        else:
+            # Prefill phase: No dropping
+            topk_weights, topk_ids, num_experts_to_keep = self.experts.custom_routing_function(
+                hidden_states, router_logits, self.top_k, True)
+            final_hidden_states = self.experts(hidden_states, router_logits)
+
         return final_hidden_states.view(orig_shape)
 
 
@@ -348,7 +391,7 @@ class MixtralForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self.config = config
         self.lora_config = lora_config
         self.quant_config = quant_config
-
+        MixtralLogitStore.create_instance(vllm_config.model_config)
         self.model = MixtralModel(vllm_config=vllm_config,
                                   prefix=maybe_prefix(prefix, "model"))
         self.unpadded_vocab_size = config.vocab_size
