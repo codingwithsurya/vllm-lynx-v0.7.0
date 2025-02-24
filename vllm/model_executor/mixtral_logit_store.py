@@ -5,17 +5,17 @@ import numpy as np
 import os
 import torch
 import csv
-# import wandb
+import wandb
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 from vllm.config import ModelConfig
 import torch.nn.functional as F
-# from vllm.engine.cdf_sketch import CDFSketch
+from vllm.engine.cdf_sketch import CDFSketch
 from vllm.sequence import SequenceGroupMetadata
 from datetime import datetime
 import pickle
-# import plotly.express as px
+import plotly.express as px
 
 
 
@@ -160,20 +160,20 @@ class MixtralLogitStore:
         df = pd.DataFrame(data, columns=['Layer', 'Confidence Percentage'])
         
         # Create the plot
-        # plt.figure(figsize=(12, 6))
-        # sns.violinplot(x='Layer', y='Confidence Percentage', data=df)
+        plt.figure(figsize=(12, 6))
+        sns.violinplot(x='Layer', y='Confidence Percentage', data=df)
         
-        # plt.title('Confidence Percentage Distribution per Layer')
-        # plt.xlabel('Layer Index')
-        # plt.ylabel('Confidence Percentage')
+        plt.title('Confidence Percentage Distribution per Layer')
+        plt.xlabel('Layer Index')
+        plt.ylabel('Confidence Percentage')
         
-        # # Improve x-axis labels if there are many layers
-        # if len(self.logit_metrics["conf_percentage"]) > 10:
-        #     plt.xticks(rotation=45)
+        # Improve x-axis labels if there are many layers
+        if len(self.logit_metrics["conf_percentage"]) > 10:
+            plt.xticks(rotation=45)
         
-        # plt.tight_layout()
-        # wandb.log({"Confidence Percentage per Layer": wandb.Image(plt)})
-        # plt.close()
+        plt.tight_layout()
+        wandb.log({"Confidence Percentage per Layer": wandb.Image(plt)})
+        plt.close()
 
     def plot_experts_dropped_per_layer(self):
         # print("Plotting confidence percentage per layer")
@@ -188,20 +188,20 @@ class MixtralLogitStore:
         df = pd.DataFrame(data, columns=['Layer', 'Experts Dropped'])
         
         # Create the plot
-        # plt.figure(figsize=(12, 6))
-        # sns.violinplot(x='Layer', y='Experts Dropped', data=df)
+        plt.figure(figsize=(12, 6))
+        sns.violinplot(x='Layer', y='Experts Dropped', data=df)
         
-        # plt.title('Experts dropped per Layer')
-        # plt.xlabel('Layer Index')
-        # plt.ylabel('Experts Dropped')
+        plt.title('Experts dropped per Layer')
+        plt.xlabel('Layer Index')
+        plt.ylabel('Experts Dropped')
         
-        # # Improve x-axis labels if there are many layers
-        # if len(self.logit_metrics["experts_dropped"]) > 10:
-        #     plt.xticks(rotation=45)
+        # Improve x-axis labels if there are many layers
+        if len(self.logit_metrics["experts_dropped"]) > 10:
+            plt.xticks(rotation=45)
         
-        # plt.tight_layout()
-        # wandb.log({"Experts_dropped per Layer": wandb.Image(plt)})
-        # plt.close()
+        plt.tight_layout()
+        wandb.log({"Experts_dropped per Layer": wandb.Image(plt)})
+        plt.close()
 
     def plot_unique_experts_per_layer(self):
         # print("Plotting confidence percentage per layer")
@@ -216,20 +216,20 @@ class MixtralLogitStore:
         df = pd.DataFrame(data, columns=['Layer', 'Unique Experts'])
         
         # Create the plot
-        # plt.figure(figsize=(12, 6))
-        # sns.violinplot(x='Layer', y='Unique Experts', data=df)
+        plt.figure(figsize=(12, 6))
+        sns.violinplot(x='Layer', y='Unique Experts', data=df)
         
-        # plt.title('Unique Experts per Layer')
-        # plt.xlabel('Layer Index')
-        # plt.ylabel('Unique Experts')
+        plt.title('Unique Experts per Layer')
+        plt.xlabel('Layer Index')
+        plt.ylabel('Unique Experts')
         
-        # # Improve x-axis labels if there are many layers
-        # if len(self.logit_metrics["unique_experts"]) > 10:
-        #     plt.xticks(rotation=45)
+        # Improve x-axis labels if there are many layers
+        if len(self.logit_metrics["unique_experts"]) > 10:
+            plt.xticks(rotation=45)
         
-        # plt.tight_layout()
-        # wandb.log({"Unique experts per Layer": wandb.Image(plt)})
-        # plt.close()
+        plt.tight_layout()
+        wandb.log({"Unique experts per Layer": wandb.Image(plt)})
+        plt.close()
 
     # @if_enabled
     # def log_confidence_scores(self, confidence_scores, layer_idx):
@@ -294,18 +294,18 @@ class MixtralLogitStore:
             print("No confidence scores to plot.")
             return
 
-        # plt.figure(figsize=(20, 12))
-        # for layer_idx, scores in self.logit_metrics["confidence_scores"].items():
-            # plt.plot(scores, label=f"Layer {layer_idx}")
+        plt.figure(figsize=(20, 12))
+        for layer_idx, scores in self.logit_metrics["confidence_scores"].items():
+            plt.plot(scores, label=f"Layer {layer_idx}")
         
-        # plt.title("Confidence Scores Across Layers")
-        # plt.xlabel("Step")
-        # plt.ylabel("Confidence Score")
-        # plt.legend()
-        # plt.tight_layout()
+        plt.title("Confidence Scores Across Layers")
+        plt.xlabel("Step")
+        plt.ylabel("Confidence Score")
+        plt.legend()
+        plt.tight_layout()
 
-        # wandb.log({"Confidence Scores for All Layers": wandb.Image(plt)})
-        # plt.close()
+        wandb.log({"Confidence Scores for All Layers": wandb.Image(plt)})
+        plt.close()
             
         
 
@@ -406,20 +406,20 @@ class MixtralLogitStore:
             df = pd.DataFrame({'Expert IDs': expert_ids, 'Reassignment Count': reassignment_counts})
 
             # Create a bar chart using Plotly Express
-            # fig = px.bar(
-            #     df,
-            #     x='Expert IDs',
-            #     y='Reassignment Count',
-            #     labels={'x': 'Expert IDs', 'y': 'Reassignment Count'},
-            #     title=f'Reassignment Counts for Layer {layer_idx}'
-            # )
-            # fig.update_layout(xaxis_title='Expert IDs', yaxis_title='Reassignment Count')
+            fig = px.bar(
+                df,
+                x='Expert IDs',
+                y='Reassignment Count',
+                labels={'x': 'Expert IDs', 'y': 'Reassignment Count'},
+                title=f'Reassignment Counts for Layer {layer_idx}'
+            )
+            fig.update_layout(xaxis_title='Expert IDs', yaxis_title='Reassignment Count')
             
-            # # Save the figure to a file
-            # fig.write_image(f"{self.full_path}/reassignment_counts_layer_{layer_idx}.png")
+            # Save the figure to a file
+            fig.write_image(f"{self.full_path}/reassignment_counts_layer_{layer_idx}.png")
 
-            # # Log the plot to wandb
-            # wandb.log({f"Layer {layer_idx} Reassignment Counts": fig})
+            # Log the plot to wandb
+            wandb.log({f"Layer {layer_idx} Reassignment Counts": fig})
             
     @if_enabled
     def log_impact_of_new_policy(self, probs_orig, probs_new, layer_idx):
@@ -437,18 +437,18 @@ class MixtralLogitStore:
         impact_of_new_policy = self.logit_metrics["impact_of_new_policy"]
         # Loop through each layer and plot the data on the same figure
         rows, cols = 4, 8  # Adjust as necessary
-        # plt.figure(figsize=(20, 12))
-        # for layer_idx, impacts in impact_of_new_policy.items():
-        #     plt.subplot(rows, cols, layer_idx + 1)
-        #     impacts_np = [impact.item() for impact in impacts]
-        #     plt.plot(impacts_np)
-        #     plt.title(f"Layer {layer_idx}")
-        #     plt.xlabel("Batch Index")
-        #     plt.ylabel("Mean Impact")
-        #     plt.tight_layout()
+        plt.figure(figsize=(20, 12))
+        for layer_idx, impacts in impact_of_new_policy.items():
+            plt.subplot(rows, cols, layer_idx + 1)
+            impacts_np = [impact.item() for impact in impacts]
+            plt.plot(impacts_np)
+            plt.title(f"Layer {layer_idx}")
+            plt.xlabel("Batch Index")
+            plt.ylabel("Mean Impact")
+            plt.tight_layout()
 
-        # wandb.log({"Impact of New Policy for All Layers": wandb.Image(plt)})
-        # plt.close()
+        wandb.log({"Impact of New Policy for All Layers": wandb.Image(plt)})
+        plt.close()
             
     @if_enabled
     def log_grouping_info(self, percentage_in_high_confidence, layer_idx):
@@ -471,18 +471,18 @@ class MixtralLogitStore:
         # Define the number of rows and columns for subplots
         rows, cols = 4, 8  # Adjust as necessary
         # Grouping Info for All Layers
-        # plt.figure(figsize=(20, 12))
-        # for layer_idx, labels in group_labels.items():
-        #     plt.subplot(rows, cols, layer_idx + 1)
-        #     labels_np = [label.item() for label in labels]
-        #     plt.plot(labels_np)
-        #     plt.title(f"Layer {layer_idx}")
-        #     plt.xlabel("Batch Index")
-        #     plt.ylabel("High Conf %")
-        #     plt.tight_layout()
+        plt.figure(figsize=(20, 12))
+        for layer_idx, labels in group_labels.items():
+            plt.subplot(rows, cols, layer_idx + 1)
+            labels_np = [label.item() for label in labels]
+            plt.plot(labels_np)
+            plt.title(f"Layer {layer_idx}")
+            plt.xlabel("Batch Index")
+            plt.ylabel("High Conf %")
+            plt.tight_layout()
 
-        # wandb.log({"Grouping Info for All Layers": wandb.Image(plt)})
-        # plt.close()
+        wandb.log({"Grouping Info for All Layers": wandb.Image(plt)})
+        plt.close()
         
     # @if_enabled
     def plot_metrics(self):
@@ -559,20 +559,20 @@ class MixtralLogitStore:
         if global_min == global_max:
             global_max += 1e-9  # Adding a small epsilon to avoid singular transformation
 
-        # plt.figure(figsize=(24, 10))
-        # ax1 = plt.subplot(1, 2, 1)
-        # sns.heatmap(original_logits.replace(-np.inf, np.nan), annot=False, fmt=".2f", cmap="vlag", ax=ax1, vmin=global_min, vmax=global_max)
-        # ax1.set_xticklabels(original_logits.columns, rotation=45, ha='right')
-        # ax1.set_title(f'Original Logits for Layer {layer_index}')
+        plt.figure(figsize=(24, 10))
+        ax1 = plt.subplot(1, 2, 1)
+        sns.heatmap(original_logits.replace(-np.inf, np.nan), annot=False, fmt=".2f", cmap="vlag", ax=ax1, vmin=global_min, vmax=global_max)
+        ax1.set_xticklabels(original_logits.columns, rotation=45, ha='right')
+        ax1.set_title(f'Original Logits for Layer {layer_index}')
 
-        # ax2 = plt.subplot(1, 2, 2)
-        # sns.heatmap(modified_logits.replace(-np.inf, np.nan), annot=False, fmt=".2f", cmap="vlag", ax=ax2, vmin=global_min, vmax=global_max)
-        # ax2.set_xticklabels(modified_logits.columns, rotation=45, ha='right')
-        # ax2.set_title(f'Modified Logits for Layer {layer_index}')
+        ax2 = plt.subplot(1, 2, 2)
+        sns.heatmap(modified_logits.replace(-np.inf, np.nan), annot=False, fmt=".2f", cmap="vlag", ax=ax2, vmin=global_min, vmax=global_max)
+        ax2.set_xticklabels(modified_logits.columns, rotation=45, ha='right')
+        ax2.set_title(f'Modified Logits for Layer {layer_index}')
 
-        # plt.tight_layout()
-        # wandb.log({f"layer_{layer_index}_batch_{batch_index}_logits_comparison": wandb.Image(plt)})
-        # plt.close()
+        plt.tight_layout()
+        wandb.log({f"layer_{layer_index}_batch_{batch_index}_logits_comparison": wandb.Image(plt)})
+        plt.close()
         
     @if_enabled    
     def save_logit_visualization_to_wandb(self, original_logits_df, modified_logits_df):
