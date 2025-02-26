@@ -411,6 +411,7 @@ def try_get_optimal_moe_config(
     M: int,
     is_marlin: bool = False,
     block_shape: Optional[List[int]] = None,
+    num_experts_to_keep: Optional[int] = None,
 ):
     from vllm.model_executor.layers.fused_moe import get_config
     override_config = get_config()
@@ -419,6 +420,8 @@ def try_get_optimal_moe_config(
     else:
         # First try to load optimal config from the file
         E, _, N = w2_shape
+        if num_experts_to_keep is not None:
+            E = num_experts_to_keep
         configs = get_moe_configs(E, N, dtype)
 
         if configs:
@@ -543,6 +546,127 @@ def get_config_dtype_str(dtype: torch.dtype,
         return "float32"
     return None
 
+# LYNX Expert Selection Logic
+def extract_voting(topk_ids: torch.Tensor, topk: int, gating_output: torch.Tensor, num_experts: int):
+    # Ensure tensors are on the same device (GPU)
+    device = topk_ids.device
+
+    # Flatten the top-k expert IDs to aggregate votes across tokens
+    flat_ids = topk_ids.reshape(-1).to(torch.int64)
+
+    # Create a tensor to store votes (initialized to zero)
+    expert_votes = torch.zeros(num_experts, device=device, dtype=torch.float32)
+
+    # Use index_add_ to accumulate votes (CUDA-compatible)
+    expert_votes.index_add_(0, flat_ids, torch.ones_like(flat_ids, dtype=torch.float32))
+
+    # Sort the votes to get the least voted experts
+    sorted_expert_votes, sorted_expert_ids = torch.sort(expert_votes)
+
+    return sorted_expert_ids
+
+def apply_mask(gating_output: torch.Tensor, sorted_expert_ids: torch.Tensor, num_experts_to_drop: int):
+    # Select the first `num_experts_to_drop` expert indices to drop
+    drop_indices = sorted_expert_ids[:num_experts_to_drop]
+    
+    # Obtain the most negative finite value representable in gating_output's dtype
+    large_negative_value = torch.finfo(gating_output.dtype).min
+    
+    # Apply the mask directly using index_fill_
+    gating_output.index_fill_(1, drop_indices, large_negative_value)
+    
+    return gating_output
+
+def extract_important(topk_weights: torch.Tensor, epsilon=1e-8):
+    """
+    Computes an importance mask based on the relative difference between the top-1 and top-2 weights.
+
+    Args:
+        topk_weights (torch.Tensor): Tensor of shape (batch_size, topk).
+        epsilon (float): Small value to prevent division by zero.
+
+    Returns:
+        importance_mask (torch.BoolTensor): Boolean mask of shape (batch_size,).
+    """
+    # Ensure topk_weights has at least two columns
+    assert topk_weights.size(1) >= 2, "topk_weights must have at least two columns."
+
+    # Compute the relative difference
+    relative_diff = (topk_weights[:, 0] - topk_weights[:, 1]) / (topk_weights[:, 0] + epsilon)
+
+    # Create the importance mask
+    importance_mask = relative_diff > 0.5
+
+    return importance_mask
+
+def apply_expert_mask(gating_output: torch.Tensor, experts_to_drop_mask: torch.Tensor):
+    """
+    Masks out the gating outputs corresponding to the experts to drop using a mask.
+
+    Args:
+        gating_output (torch.Tensor): Tensor of shape (batch_size, num_experts).
+        experts_to_drop_mask (torch.BoolTensor): Boolean mask of shape (num_experts,).
+
+    Returns:
+        gating_output (torch.Tensor): Modified gating_output with unnecessary experts masked out.
+    """
+    # Obtain the most negative finite value representable in gating_output's dtype
+    large_negative_value = torch.finfo(gating_output.dtype).min
+
+    # Apply the mask directly using masked_fill_
+    gating_output.masked_fill_(experts_to_drop_mask.unsqueeze(0), large_negative_value)
+
+    return gating_output
+
+def optimize_expert_selection(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    gating_output: torch.Tensor,
+    num_experts: int,
+    min_experts: int = 2
+):
+    """
+    Optimizes expert selection by keeping all unique experts from important tokens and ensuring
+    at least `min_experts` experts are kept, without using data-dependent control flow.
+
+    Args:
+        topk_ids (torch.Tensor): Tensor of shape (batch_size, topk), containing the top-k expert IDs for each token.
+        topk_weights (torch.Tensor): Tensor of shape (batch_size, topk), containing the top-k weights for each token.
+        gating_output (torch.Tensor): Tensor of shape (batch_size, num_experts), containing the gating outputs.
+        num_experts (int): Total number of experts.
+        min_experts (int): Minimum number of experts to keep.
+
+    Returns:
+        gating_output (torch.Tensor): Modified gating_output with unnecessary experts masked out.
+        num_experts_to_keep (int): Number of experts kept after optimization.
+    """
+    # Step 1: Compute the importance mask
+    importance_mask = extract_important(topk_weights)
+
+    # Step 2: Get the top-1 expert IDs (ensure dtype is torch.int64)
+    top1_expert_ids = topk_ids[:, 0].long()
+
+    # Step 3: Compute importance weights (0 or 1)
+    importance_weights = importance_mask.to(torch.int32)
+
+    # Step 4: Accumulate counts of important experts
+    counts = torch.zeros(num_experts, dtype=torch.int32, device=top1_expert_ids.device)
+    counts.scatter_add_(0, top1_expert_ids, importance_weights)
+
+    # Step 5: Create a mask for experts with counts > 0 (unique experts from important tokens)
+    experts_to_keep_mask = counts > 0  # Shape: (num_experts,)
+
+    # Step 6: Create experts_to_drop_mask
+    experts_to_drop_mask = ~experts_to_keep_mask
+
+    # Step 7: Apply the mask to drop unnecessary experts
+    gating_output = apply_expert_mask(gating_output, experts_to_drop_mask)
+
+    # how many experts are kept
+    num_experts_to_keep = experts_to_keep_mask.sum()
+
+    # Return the modified gating_output
+    return gating_output, num_experts_to_keep
 
 def inplace_fused_experts(hidden_states: torch.Tensor,
                           w1: torch.Tensor,
@@ -555,10 +679,11 @@ def inplace_fused_experts(hidden_states: torch.Tensor,
                           w2_scale: Optional[torch.Tensor] = None,
                           a1_scale: Optional[torch.Tensor] = None,
                           a2_scale: Optional[torch.Tensor] = None,
-                          block_shape: Optional[List[int]] = None) -> None:
+                          block_shape: Optional[List[int]] = None,
+                          num_experts_to_keep: Optional[int] = None) -> None:
     fused_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids, True,
                        use_fp8_w8a8, use_int8_w8a16, w1_scale, w2_scale,
-                       a1_scale, a2_scale, block_shape)
+                       a1_scale, a2_scale, block_shape, num_experts_to_keep)
 
 
 def inplace_fused_experts_fake(
@@ -573,7 +698,8 @@ def inplace_fused_experts_fake(
         w2_scale: Optional[torch.Tensor] = None,
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
-        block_shape: Optional[List[int]] = None) -> None:
+        block_shape: Optional[List[int]] = None,
+        num_experts_to_keep: Optional[int] = None) -> None:
     pass
 
 
@@ -597,10 +723,12 @@ def outplace_fused_experts(
         w2_scale: Optional[torch.Tensor] = None,
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
-        block_shape: Optional[List[int]] = None) -> torch.Tensor:
+        block_shape: Optional[List[int]] = None,
+        num_experts_to_keep: Optional[int] = None) -> torch.Tensor:
     return fused_experts_impl(hidden_states, w1, w2, topk_weights, topk_ids,
                               False, use_fp8_w8a8, use_int8_w8a16, w1_scale,
-                              w2_scale, a1_scale, a2_scale, block_shape)
+                              w2_scale, a1_scale, a2_scale, block_shape, 
+                              num_experts_to_keep)
 
 
 def outplace_fused_experts_fake(
@@ -615,7 +743,8 @@ def outplace_fused_experts_fake(
         w2_scale: Optional[torch.Tensor] = None,
         a1_scale: Optional[torch.Tensor] = None,
         a2_scale: Optional[torch.Tensor] = None,
-        block_shape: Optional[List[int]] = None) -> torch.Tensor:
+        block_shape: Optional[List[int]] = None,
+        num_experts_to_keep: Optional[int] = None) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
 
@@ -639,21 +768,24 @@ def fused_experts(hidden_states: torch.Tensor,
                   w2_scale: Optional[torch.Tensor] = None,
                   a1_scale: Optional[torch.Tensor] = None,
                   a2_scale: Optional[torch.Tensor] = None,
-                  block_shape: Optional[List[int]] = None):
+                  block_shape: Optional[List[int]] = None,
+                  num_experts_to_keep: Optional[int] = None):
     if inplace:
         torch.ops.vllm.inplace_fused_experts(hidden_states, w1, w2,
-                                             topk_weights, topk_ids,
-                                             use_fp8_w8a8, use_int8_w8a16,
-                                             w1_scale, w2_scale, a1_scale,
-                                             a2_scale, block_shape)
+                                            topk_weights, topk_ids,
+                                            use_fp8_w8a8, use_int8_w8a16,
+                                            w1_scale, w2_scale, a1_scale,
+                                            a2_scale, block_shape, 
+                                            num_experts_to_keep)
         return hidden_states
     else:
         return torch.ops.vllm.outplace_fused_experts(hidden_states, w1, w2,
-                                                     topk_weights, topk_ids,
-                                                     use_fp8_w8a8,
-                                                     use_int8_w8a16, w1_scale,
-                                                     w2_scale, a1_scale,
-                                                     a2_scale, block_shape)
+                                                    topk_weights, topk_ids,
+                                                    use_fp8_w8a8,
+                                                    use_int8_w8a16, w1_scale,
+                                                    w2_scale, a1_scale,
+                                                    a2_scale, block_shape,
+                                                    num_experts_to_keep)
 
 
 def fused_experts_impl(hidden_states: torch.Tensor,
@@ -668,7 +800,8 @@ def fused_experts_impl(hidden_states: torch.Tensor,
                        w2_scale: Optional[torch.Tensor] = None,
                        a1_scale: Optional[torch.Tensor] = None,
                        a2_scale: Optional[torch.Tensor] = None,
-                       block_shape: Optional[List[int]] = None):
+                       block_shape: Optional[List[int]] = None,
+                       num_experts_to_keep: Optional[int] = None):
     # Check constraints.
     assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
@@ -681,6 +814,11 @@ def fused_experts_impl(hidden_states: torch.Tensor,
 
     num_tokens, _ = hidden_states.shape
     E, N, _ = w1.shape
+    
+    # Use the number of experts to keep instead of total experts if provided
+    if num_experts_to_keep is not None:
+        E = num_experts_to_keep
+        
     # We execute the fused_moe kernel in chunks to circumvent this issue:
     # https://github.com/vllm-project/vllm/issues/5938
     CHUNK_SIZE = envs.VLLM_FUSED_MOE_CHUNK_SIZE
@@ -696,6 +834,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
         topk_ids.shape[1],
         config_dtype,
         block_shape=block_shape,
+        num_experts_to_keep=E,
     )
 
     config = get_config_func(M)
@@ -747,6 +886,7 @@ def fused_experts_impl(hidden_states: torch.Tensor,
         curr_topk_ids = topk_ids[begin_chunk_idx:end_chunk_idx]
         curr_topk_weights = topk_weights[begin_chunk_idx:end_chunk_idx]
 
+        # We use E here (which might be num_experts_to_keep) instead of w1.shape[0]
         sorted_token_ids, expert_ids, num_tokens_post_padded = (
             moe_align_block_size(curr_topk_ids, config['BLOCK_SIZE_M'], E))
 
@@ -801,6 +941,7 @@ def fused_moe(
     gating_output: torch.Tensor,
     topk: int,
     renormalize: bool,
+    num_experts_to_drop: int = 0,  # LYNX parameter
     inplace: bool = False,
     use_grouped_topk: bool = False,
     num_expert_group: Optional[int] = None,
@@ -826,6 +967,7 @@ def fused_moe(
         (before softmax).
     - topk (int): The number of top-k experts to select.
     - renormalize (bool): If True, renormalize the top-k weights to sum to 1.
+    - num_experts_to_drop (int): Number of experts to drop using the LYNX policy.
     - inplace (bool): If True, perform the operation in-place.
         Defaults to False.
     - num_expert_group: Optional[int]: additional parameter for grouped_topk
@@ -852,29 +994,49 @@ def fused_moe(
     """
     # Check constraints.
     assert gating_output.shape[1] == w1.shape[0], "Number of experts mismatch"
-
+    
+    # LYNX Simple Policy implementation
+    if num_experts_to_drop > 0:
+        # Get initial topk IDs for voting (but don't modify gating outputs yet)
+        initial_topk_weights, initial_topk_ids = fused_topk(
+            hidden_states, gating_output, topk, renormalize
+        )
+        
+        # Extract voting from the topk IDs
+        sorted_expert_ids = extract_voting(initial_topk_ids, topk, gating_output, gating_output.shape[1])
+        
+        # Apply mask to gating outputs
+        gating_output = apply_mask(gating_output, sorted_expert_ids, num_experts_to_drop)
+        
+        # Calculate how many experts we're keeping
+        experts_to_keep = gating_output.shape[1] - num_experts_to_drop
+    else:
+        experts_to_keep = None  # Use all experts
+    
+    # Get the final topk experts after masking
     if use_grouped_topk:
         assert num_expert_group is not None and topk_group is not None
         topk_weights, topk_ids = grouped_topk(hidden_states, gating_output,
-                                              topk, renormalize,
-                                              num_expert_group, topk_group)
+                                            topk, renormalize,
+                                            num_expert_group, topk_group)
     elif custom_routing_function is None:
         topk_weights, topk_ids = fused_topk(hidden_states, gating_output, topk,
-                                            renormalize)
+                                           renormalize)
     else:
         topk_weights, topk_ids = custom_routing_function(
             hidden_states, gating_output, topk, renormalize)
 
     return fused_experts(hidden_states,
-                         w1,
-                         w2,
-                         topk_weights,
-                         topk_ids,
-                         inplace=inplace,
-                         use_fp8_w8a8=use_fp8_w8a8,
-                         use_int8_w8a16=use_int8_w8a16,
-                         w1_scale=w1_scale,
-                         w2_scale=w2_scale,
-                         a1_scale=a1_scale,
-                         a2_scale=a2_scale,
-                         block_shape=block_shape)
+                        w1,
+                        w2,
+                        topk_weights,
+                        topk_ids,
+                        inplace=inplace,
+                        use_fp8_w8a8=use_fp8_w8a8,
+                        use_int8_w8a16=use_int8_w8a16,
+                        w1_scale=w1_scale,
+                        w2_scale=w2_scale,
+                        a1_scale=a1_scale,
+                        a2_scale=a2_scale,
+                        block_shape=block_shape,
+                        num_experts_to_keep=experts_to_keep)

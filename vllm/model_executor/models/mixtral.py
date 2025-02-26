@@ -69,12 +69,17 @@ class MixtralMoE(nn.Module):
                  params_dtype: Optional[torch.dtype] = None,
                  quant_config: Optional[QuantizationConfig] = None,
                  tp_size: Optional[int] = None,
-                 prefix: str = ""):
+                 prefix: str = "",
+                 # LYNX parameters
+                 num_experts_to_keep: Optional[int] = None):
         super().__init__()
         self.hidden_size = hidden_size
+        self.is_prefill = True  # Will be set externally
+
+        # LYNX: Store the number of experts to keep during decoding
+        self.num_experts_to_keep = num_experts_to_keep if num_experts_to_keep is not None else num_experts
 
         # Gate always runs at half / full precision for now.
-
         self.gate = ReplicatedLinear(hidden_size,
                                      num_experts,
                                      bias=False,
@@ -82,6 +87,7 @@ class MixtralMoE(nn.Module):
                                      quant_config=None,
                                      prefix=f"{prefix}.gate")
 
+        # LYNX: Pass the num_experts_to_drop parameter to FusedMoE
         self.experts = FusedMoE(num_experts=num_experts,
                                 top_k=top_k,
                                 hidden_size=hidden_size,
@@ -91,14 +97,27 @@ class MixtralMoE(nn.Module):
                                 renormalize=True,
                                 quant_config=quant_config,
                                 tp_size=tp_size,
-                                prefix=f"{prefix}.experts")
+                                prefix=f"{prefix}.experts",
+                                num_experts_to_drop=0)  # Default is 0, will be dynamically set in forward
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
+        
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
+        
+        # LYNX: Set number of experts to drop based on prefill/decode phase
+        num_experts_to_drop = 0
+        if not self.is_prefill:
+            # During decoding, drop the specified number of experts
+            num_experts_to_drop = self.experts.num_experts - self.num_experts_to_keep
+            
+        # Dynamically set the num_experts_to_drop parameter
+        self.experts.num_experts_to_drop = num_experts_to_drop
+        
+        # Forward pass through the experts
         final_hidden_states = self.experts(hidden_states, router_logits)
         return final_hidden_states.view(orig_shape)
 
@@ -206,13 +225,19 @@ class MixtralDecoderLayer(nn.Module):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn")
+            
+        # LYNX: Pass num_experts_to_keep parameter from config if available
+        num_experts_to_keep = getattr(config, "num_experts_to_keep", None)
+        
         self.block_sparse_moe = MixtralMoE(
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
-            prefix=f"{prefix}.block_sparse_moe")
+            prefix=f"{prefix}.block_sparse_moe",
+            num_experts_to_keep=num_experts_to_keep)
+            
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
@@ -239,6 +264,10 @@ class MixtralDecoderLayer(nn.Module):
             kv_cache=kv_cache,
             attn_metadata=attn_metadata,
         )
+
+        # TODO LYNX: Determine if we're in prefill or decode phase
+        # Can also do it via MixtralLogitStore (given that we are in default scheduling)
+        # self.block_sparse_moe.is_prefill = (attn_metadata.num_prefill_tokens > 0)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
@@ -348,6 +377,12 @@ class MixtralForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self.config = config
         self.lora_config = lora_config
         self.quant_config = quant_config
+
+        # LYNX: Add LYNX configuration parameters to the model config if provided
+        if hasattr(config, "num_experts_to_keep"):
+            self.num_experts_to_keep = config.num_experts_to_keep
+        else:
+            self.num_experts_to_keep = None
 
         self.model = MixtralModel(vllm_config=vllm_config,
                                   prefix=maybe_prefix(prefix, "model"))

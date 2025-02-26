@@ -16,9 +16,13 @@ from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
 
 if current_platform.is_cuda_alike():
-    from .fused_moe import fused_experts
+    from .fused_moe import fused_experts, fused_topk, extract_voting, apply_mask, optimize_expert_selection
 else:
     fused_experts = None  # type: ignore
+    fused_topk = None     # type: ignore
+    extract_voting = None # type: ignore
+    apply_mask = None     # type: ignore
+    optimize_expert_selection = None # type: ignore
 if current_platform.is_tpu():
     # the iterative moe implementation is used until the moe_pallas is fixed
     from .moe_torch_iterative import fused_moe as fused_moe_pallas
@@ -55,7 +59,8 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        num_experts_to_drop: int = 0
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -113,7 +118,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        num_experts_to_drop: int = 0
     ) -> torch.Tensor:
         return self.forward(x=x,
                             layer=layer,
@@ -125,7 +131,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                             num_expert_group=num_expert_group,
                             custom_routing_function=custom_routing_function,
                             scoring_func=scoring_func,
-                            e_score_correction_bias=e_score_correction_bias)
+                            e_score_correction_bias=e_score_correction_bias,
+                            num_experts_to_drop=num_experts_to_drop)
 
     def forward_cuda(
         self,
@@ -139,9 +146,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        num_experts_to_drop: int = 0
     ) -> torch.Tensor:
-        topk_weights, topk_ids = FusedMoE.select_experts(
+        # Using select_experts with num_experts_to_drop parameter
+        topk_weights, topk_ids, num_experts_kept = FusedMoE.select_experts(
             hidden_states=x,
             router_logits=router_logits,
             use_grouped_topk=use_grouped_topk,
@@ -151,14 +160,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias)
+            e_score_correction_bias=e_score_correction_bias,
+            num_experts_to_drop=num_experts_to_drop)
 
         return fused_experts(hidden_states=x,
                              w1=layer.w13_weight,
                              w2=layer.w2_weight,
                              topk_weights=topk_weights,
                              topk_ids=topk_ids,
-                             inplace=True)
+                             inplace=True,
+                             num_experts_to_keep=num_experts_kept)
 
     def forward_cpu(
         self,
@@ -196,7 +207,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         num_expert_group: Optional[int] = None,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
-        e_score_correction_bias: Optional[torch.Tensor] = None
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        **kwargs
     ) -> torch.Tensor:
         assert not use_grouped_topk
         assert num_expert_group is None
@@ -237,6 +249,7 @@ class FusedMoE(torch.nn.Module):
         reduce_results: Whether to all all_reduce on the output of the layer
         renomalize: Whether to renormalize the logits in the fused_moe kernel
         quant_config: Quantization configure.
+        num_experts_to_drop: Number of experts to drop (LYNX optimization)
     """
 
     def __init__(
@@ -257,6 +270,7 @@ class FusedMoE(torch.nn.Module):
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
+        num_experts_to_drop: int = 0
     ):
         super().__init__()
 
@@ -267,6 +281,8 @@ class FusedMoE(torch.nn.Module):
                         get_tensor_model_parallel_world_size())
         self.top_k = top_k
         self.num_experts = num_experts
+        self.num_experts_to_drop = num_experts_to_drop  # LYNX parameter
+        
         assert intermediate_size % self.tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
         self.reduce_results = reduce_results
@@ -545,11 +561,54 @@ class FusedMoE(torch.nn.Module):
                        num_expert_group: Optional[int] = None,
                        custom_routing_function: Optional[Callable] = None,
                        scoring_func: str = "softmax",
-                       e_score_correction_bias: Optional[torch.Tensor] = None):
-        from vllm.model_executor.layers.fused_moe.fused_moe import (
-            fused_topk, grouped_topk)
+                       e_score_correction_bias: Optional[torch.Tensor] = None,
+                       num_experts_to_drop: int = 0) -> Tuple[torch.Tensor, torch.Tensor, Optional[int]]:
+        """
+        Select top-k experts for each token.
+        
+        Parameters:
+            hidden_states: Input tensor of shape [num_tokens, hidden_size]
+            router_logits: Router output tensor of shape [num_tokens, num_experts]
+            top_k: Number of experts to select per token
+            use_grouped_topk: Whether to use grouped top-k selection
+            renormalize: Whether to renormalize the expert weights
+            topk_group: Number of expert groups to consider in grouped top-k
+            num_expert_group: Number of expert groups
+            custom_routing_function: Custom function for expert selection
+            scoring_func: Function used to score experts ("softmax" or "sigmoid")
+            e_score_correction_bias: Bias term for expert selection correction
+            num_experts_to_drop: Number of least-used experts to drop (LYNX optimization)
+            
+        Returns:
+            topk_weights: Tensor of shape [num_tokens, top_k] with weights for the selected experts
+            topk_ids: Tensor of shape [num_tokens, top_k] with indices of the selected experts
+            num_experts_kept: Number of experts kept after dropping (or None if no dropping)
+        """
+        from .fused_moe import (fused_topk, grouped_topk, extract_voting, apply_mask)
+        
+        # Apply LYNX expert selection optimization if needed
+        num_experts_kept = None
+        if num_experts_to_drop > 0:
+            # Get initial topk IDs for voting - for LYNX we need to do this to identify which
+            # experts to drop, even though we'll re-do the topk selection afterward
+            initial_topk_weights, initial_topk_ids = fused_topk(
+                hidden_states, router_logits, top_k, renormalize
+            )
+            
+            # Extract voting - identify which experts are least used
+            sorted_expert_ids = extract_voting(
+                initial_topk_ids, top_k, router_logits, router_logits.shape[1]
+            )
+            
+            # Apply mask to exclude the least-used experts
+            router_logits = apply_mask(
+                router_logits, sorted_expert_ids, num_experts_to_drop
+            )
+            
+            # Calculate how many experts we're keeping
+            num_experts_kept = router_logits.shape[1] - num_experts_to_drop
 
-        # DeekSeekv2 uses grouped_top_k
+        # Final expert selection after potential LYNX optimization
         if use_grouped_topk:
             assert topk_group is not None
             assert num_expert_group is not None
@@ -564,9 +623,9 @@ class FusedMoE(torch.nn.Module):
                 e_score_correction_bias=e_score_correction_bias)
         elif custom_routing_function is None:
             topk_weights, topk_ids = fused_topk(hidden_states=hidden_states,
-                                                gating_output=router_logits,
-                                                topk=top_k,
-                                                renormalize=renormalize)
+                                               gating_output=router_logits,
+                                               topk=top_k,
+                                               renormalize=renormalize)
         else:
             topk_weights, topk_ids = custom_routing_function(
                 hidden_states=hidden_states,
@@ -574,7 +633,7 @@ class FusedMoE(torch.nn.Module):
                 topk=top_k,
                 renormalize=renormalize)
 
-        return topk_weights, topk_ids
+        return topk_weights, topk_ids, num_experts_kept
 
     def forward(self, hidden_states: torch.Tensor,
                 router_logits: torch.Tensor):
@@ -592,7 +651,8 @@ class FusedMoE(torch.nn.Module):
             num_expert_group=self.num_expert_group,
             custom_routing_function=self.custom_routing_function,
             scoring_func=self.scoring_func,
-            e_score_correction_bias=self.e_score_correction_bias)
+            e_score_correction_bias=self.e_score_correction_bias,
+            num_experts_to_drop=self.num_experts_to_drop)
 
         if self.reduce_results and self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(
