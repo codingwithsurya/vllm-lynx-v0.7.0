@@ -56,6 +56,9 @@ from vllm.worker.model_runner_base import (
     _add_sampling_metadata_broadcastable_dict,
     _init_attn_metadata_from_tensor_dict,
     _init_sampling_metadata_from_tensor_dict, dump_input_when_exception)
+from vllm.engine.metric_logging import MetricStore
+from vllm.engine.metric_logging import TaskType, TaskLoggingContextManagerCPU
+from vllm.model_executor.mixtral_logit_store import MixtralLogitStore
 
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionBackend
@@ -1435,7 +1438,14 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
                     " consider decreasing `gpu_memory_utilization` or "
                     "switching to eager mode. You can also reduce the "
                     "`max_num_seqs` as needed to decrease memory usage.")
+
         start_time = time.perf_counter()
+        
+        MetricStore.get_instance().profile_complete = True
+        MetricStore.get_instance().is_prefill = False
+        MixtralLogitStore.get_instance().profile_complete = True
+        MixtralLogitStore.get_instance().is_prefill = False
+
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
 
         # Prepare dummy inputs. These will be reused for all batch sizes.
@@ -1656,6 +1666,10 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
             assert model_input.lora_mapping is not None
             self.set_active_loras(model_input.lora_requests,
                                   model_input.lora_mapping)
+        
+        seq_group_metadata_list = model_input.seq_group_metadata_list or []
+        MetricStore.get_instance().on_batch_start_worker(seq_group_metadata_list)
+        MixtralLogitStore.get_instance().on_batch_start_worker(seq_group_metadata_list)
 
         if self.prompt_adapter_config:
             assert model_input.prompt_adapter_requests is not None
@@ -1804,6 +1818,8 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                 hidden_states = hidden_or_intermediate_states
 
             output.hidden_states = hidden_states
+        MetricStore.get_instance().on_batch_end_worker()
+        MixtralLogitStore.get_instance().on_batch_end_worker()
 
         return [output]
 

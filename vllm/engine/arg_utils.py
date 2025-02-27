@@ -199,6 +199,10 @@ class EngineArgs:
 
     calculate_kv_scales: Optional[bool] = None
 
+    mixtral_config_file: Optional[str] = None # "./mixtral_configs/none-none-2.json"       ### new, contains num experts and drop policy
+    disable_logit_logging: bool = False
+    logit_logging_frequency: Optional[int] = None 
+    disable_latency_logging: bool = False
     def __post_init__(self):
         if not self.tokenizer:
             self.tokenizer = self.model
@@ -957,6 +961,40 @@ class EngineArgs:
             'If calculate-kv-scales is false, the scales will '
             'be loaded from the model checkpoint if available. '
             'Otherwise, the scales will default to 1.0.')
+        
+        parser.add_argument(
+            '--num_experts',
+            type=int,
+            default=8,
+            help="Provide number of experts to initialize the model.",
+        )
+
+        parser.add_argument(
+            '--mixtral_config_file',
+            type=str,
+            default="./mixtral_configs/none-none-2.json",
+            help="Provide path to mixtral config file to choose expert policies.",
+        )
+
+        parser.add_argument(
+            '--disable_logit_logging',
+            action='store_true',
+            help="Disable logging of logit values.",
+        )
+
+        parser.add_argument(
+            '--disable_latency_logging',
+            action='store_true',
+            help="Disable logging of latency values.",
+        )
+
+        parser.add_argument(
+            '--logit_logging_frequency',
+            type=int,
+            default=100,
+            help="Frequency of logging logit values, used for debugging and visualizing purposes",
+        )
+
 
         return parser
 
@@ -1003,6 +1041,12 @@ class EngineArgs:
             logits_processor_pattern=self.logits_processor_pattern,
             generation_config=self.generation_config,
             enable_sleep_mode=self.enable_sleep_mode,
+            
+            num_experts=self.num_experts, 
+            mixtral_config_file=self.mixtral_config_file, 
+            disable_logit_logging=self.disable_logit_logging, 
+            disable_latency_logging=self.disable_latency_logging, 
+            logit_logging_frequency=self.logit_logging_frequency,
         )
 
     def create_load_config(self) -> LoadConfig:

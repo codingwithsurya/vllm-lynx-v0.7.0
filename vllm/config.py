@@ -10,7 +10,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Counter, Dict,
                     Final, List, Literal, Mapping, Optional, Protocol, Set,
-                    Tuple, Type, Union)
+                    Tuple, Type, Union, TypedDict)
 
 import torch
 from pydantic import BaseModel, Field, PrivateAttr
@@ -73,6 +73,11 @@ _TASK_RUNNER: Dict[_ResolvedTask, RunnerType] = {
 HfOverrides = Union[Dict[str, Any], Callable[[PretrainedConfig],
                                              PretrainedConfig]]
 
+class MixtralConfigOverride(TypedDict):
+    num_local_experts: int
+    policy: str
+    num_experts_to_keep: int
+    top_k: int
 
 class SupportsHash(Protocol):
 
@@ -224,6 +229,11 @@ class ModelConfig:
         logits_processor_pattern: Optional[str] = None,
         generation_config: Optional[str] = None,
         enable_sleep_mode: bool = False,
+        num_experts: int = 8,
+        mixtral_config_file: Optional[str] = None,
+        disable_logit_logging: Optional[bool] = False,
+        disable_latency_logging: Optional[bool] = False,
+        logit_logging_frequency: Optional[int] = None,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -292,10 +302,18 @@ class ModelConfig:
         self.hf_config = hf_config
 
         self.hf_text_config = get_hf_text_config(self.hf_config)
+
+        self.num_experts = num_experts
+        self.mixtral_config_file = mixtral_config_file
+        self.disable_logit_logging = disable_logit_logging
+        self.disable_latency_logging = disable_latency_logging
+        self.logit_logging_frequency = logit_logging_frequency
+
         self.encoder_config = self._get_encoder_config()
         self.hf_image_processor_config = get_hf_image_processor_config(
             self.model, revision)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
+         self._modify_mixtral_config()
         self.use_async_output_proc = use_async_output_proc
         self.mm_processor_kwargs = mm_processor_kwargs
         self.disable_mm_preprocessor_cache = disable_mm_preprocessor_cache
@@ -614,6 +632,30 @@ class ModelConfig:
                 "CUDA graph is not supported for %s yet, fallback to the eager "
                 "mode.", self.hf_config.model_type)
             self.enforce_eager = True
+
+    def _parse_mixtral_config(self, config_file_path) -> MixtralConfigOverride:
+        print("The value of logit logging frequency is: ", self.logit_logging_frequency)
+        with open(config_file_path) as file:
+            return json.load(file)
+
+    def _modify_mixtral_config(self):
+        if self.mixtral_config_file is None:
+            print("Config file not provided.")
+            return
+        architectures = getattr(self.hf_config, "architectures", [])
+        # print(architectures)
+        # print(self.hf_config)
+        if len(set(architectures).intersection(["MixtralForCausalLM", "DbrxForCausalLM"])) > 0:
+            # print(f"MixtralConfigOverride file: {self.mixtral_config_file}")
+            mixtral_config = self._parse_mixtral_config(self.mixtral_config_file)
+            # print(mixtral_config)
+            for k, v in mixtral_config.items():
+                setattr(self.hf_config, k, v)   # override in MixtralConfig.hf_config
+        else:
+            print("Model not Mixtral/AttributeError: num_local_experts not found.")
+
+    def get_num_experts(self) -> int:
+        return self.num_experts
 
     def _verify_bnb_config(self) -> None:
         """
