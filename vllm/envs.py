@@ -506,6 +506,10 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     # TTFT and overall throughput.
     "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE":
     lambda: int(os.getenv("VLLM_V1_OUTPUT_PROC_CHUNK_SIZE", "128")),
+
+    "VLLM_TEST_COMPILE_NO_CUSTOM_OPS":
+    lambda: int(os.environ.get("VLLM_TEST_COMPILE_NO_CUSTOM_OPS", "0")),
+
 }
 
 # end-env-vars-definition

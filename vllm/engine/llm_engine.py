@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from functools import partial
 from typing import (TYPE_CHECKING, Callable, ClassVar, Deque, Dict, Iterable,
                     List, Mapping, NamedTuple, Optional)
+
+import wandb
+
 from typing import Sequence as GenericSequence
 from typing import Set, Type, Union, cast, overload
 
@@ -25,6 +28,10 @@ from vllm.engine.output_processor.interfaces import (
     SequenceGroupOutputProcessor)
 from vllm.engine.output_processor.stop_checker import StopChecker
 from vllm.engine.output_processor.util import create_output_by_sequence_group
+
+import atexit
+from vllm.engine.metric_logging import TaskLoggingContextManagerCPU, MetricStore
+
 from vllm.entrypoints.openai.logits_processors import (
     get_logits_processors as get_openai_logits_processors)
 from vllm.executor.executor_base import ExecutorBase
@@ -57,6 +64,9 @@ from vllm.transformers_utils.tokenizer_group import (
 from vllm.usage.usage_lib import (UsageContext, is_usage_stats_enabled,
                                   usage_message)
 from vllm.utils import Counter, Device, deprecate_kwargs, weak_bind
+
+from vllm.model_executor.mixtral_logit_store import MixtralLogitStore
+
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
@@ -257,6 +267,18 @@ class LLMEngine:
             return tokenizer_group.get_lora_tokenizer(sequence.lora_request)
 
         self.seq_counter = Counter()
+        
+        if wandb.run is None:
+            wandb.init(project="MLSys_Prowl",
+                    group="visualizing experts",
+                    config=model_config.__dict__,
+                    )
+
+        MetricStore.get_or_create_instance(vllm_config)
+        MixtralLogitStore.create_instance(vllm_config.model_config)
+
+        MetricStore.get_instance().setting_params(vllm_config.model_config)
+
         self.generation_config_fields = (
             self.model_config.try_get_generation_config())
 
@@ -2006,3 +2028,8 @@ class LLMEngine:
                 sampling_params.logits_processors.extend(logits_processors)
 
         return sampling_params
+
+    def exit_handler(self):
+        print("Process is exiting...")
+        MetricStore.get_instance().plot_metrics()
+        MixtralLogitStore.get_instance().plot_metrics()
