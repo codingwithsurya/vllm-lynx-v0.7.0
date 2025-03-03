@@ -124,7 +124,7 @@ class CustomOp(nn.Module):
         return compilation_config.level < CompilationLevel.PIECEWISE and \
             not count_none > 0 or count_all > 0
    
-     def forward_gaudi(self, *args, **kwargs):
+    def forward_gaudi(self, *args, **kwargs):
         # By default, we assume that Gaudi ops are compatible with the
         # PyTorch-native implementation.
         # NOTE(woosuk): This is a placeholder for future extensions.

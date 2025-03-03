@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Set, Tuple, Type, Union
 import torch
 import torch.distributed
 
+from vllm.engine.metric_logging import MetricStore
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.device_allocator.cumem import CuMemAllocator
@@ -17,6 +18,7 @@ from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.model_executor import set_random_seed
 from vllm.model_executor.layers.sampler import SamplerOutput
+from vllm.model_executor.mixtral_logit_store import MixtralLogitStore
 from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
 from vllm.platforms import current_platform
 from vllm.prompt_adapter.request import PromptAdapterRequest

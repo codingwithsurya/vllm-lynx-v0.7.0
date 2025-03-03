@@ -313,7 +313,7 @@ class ModelConfig:
         self.hf_image_processor_config = get_hf_image_processor_config(
             self.model, revision)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
-         self._modify_mixtral_config()
+        self._modify_mixtral_config()
         self.use_async_output_proc = use_async_output_proc
         self.mm_processor_kwargs = mm_processor_kwargs
         self.disable_mm_preprocessor_cache = disable_mm_preprocessor_cache

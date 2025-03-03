@@ -271,7 +271,7 @@ class LLMEngine:
         if wandb.run is None:
             wandb.init(project="MLSys_Prowl",
                     group="visualizing experts",
-                    config=model_config.__dict__,
+                    config=self.model_config.__dict__,
                     )
 
         MetricStore.get_or_create_instance(vllm_config)

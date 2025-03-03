@@ -100,6 +100,7 @@ class EngineArgs:
     kv_cache_dtype: str = 'auto'
     seed: int = 0
     max_model_len: Optional[int] = None
+    num_experts: int = 8
     # Note: Specifying a custom executor backend by passing a class
     # is intended for expert use only. The API may change without
     # notice.
@@ -151,6 +152,7 @@ class EngineArgs:
     long_lora_scaling_factors: Optional[Tuple[float]] = None
     lora_dtype: Optional[Union[str, torch.dtype]] = 'auto'
     max_cpu_loras: Optional[int] = None
+    num_experts : int = 8
     device: str = 'auto'
     num_scheduler_steps: int = 1
     multi_step_stream_outputs: bool = True
@@ -158,6 +160,10 @@ class EngineArgs:
     num_gpu_blocks_override: Optional[int] = None
     num_lookahead_slots: int = 0
     model_loader_extra_config: Optional[dict] = None
+    mixtral_config_file: Optional[str] = None # "./mixtral_configs/none-none-2.json"       ### new, contains num experts and drop policy
+    disable_logit_logging: bool = False
+    logit_logging_frequency: Optional[int] = None 
+    disable_latency_logging: bool = False
     ignore_patterns: Optional[Union[str, List[str]]] = None
     preemption_mode: Optional[str] = None
 
